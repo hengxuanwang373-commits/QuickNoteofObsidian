@@ -77,21 +77,26 @@ def ensure_daily_file():
     return diary_path
 
 def save_to_daily(content: str):
-    # 处理图片路径文本 (从对话框粘贴的图片)
     import re
+    image_links = []
+
+    # 处理图片路径文本 (从对话框粘贴的图片引用)
     image_ref_pattern = r'\[Image:\s*source:\s*(/var/[^]]+)\]'
     has_image_refs = re.search(image_ref_pattern, content, re.IGNORECASE) if content else False
 
-    image_links = []
     if has_image_refs:
-        # 有图片引用 - 直接从剪贴板读取图片
-        # (临时文件可能已清理,所以直接从剪贴板读取)
         clip_link = save_clipboard_image()
         if clip_link:
             image_links.append(clip_link)
-
-        # 移除所有图片引用
         content = re.sub(image_ref_pattern, '', content, flags=re.IGNORECASE)
+
+    content = content.strip()
+
+    # 如果内容为空但仍尝试保存图片，也检查剪贴板
+    if not content:
+        clip_link = save_clipboard_image()
+        if clip_link:
+            image_links.append(clip_link)
 
     content = content.strip()
 
@@ -140,50 +145,106 @@ def copy_attachment(file_path: Path) -> str:
 def save_clipboard_image() -> str:
     """保存剪贴板图片，返回 markdown 链接"""
     timestamp = datetime.now().strftime("%H%M%S")
-    temp_tiff = f"/tmp/qn_clip_{timestamp}.tiff"
     temp_png = f"/tmp/qn_clip_{timestamp}.png"
 
-    # 方法1: 用 pngpaste (如果安装了)
+    # 方法1: 用 python3 + AppKit 读取剪贴板图片 (macOS 原生, 最可靠)
+    try:
+        python_clipboard_script = f'''
+import sys
+try:
+    from AppKit import NSPasteboard, NSBitmapImageRep
+    from Foundation import NSData
+    pb = NSPasteboard.generalPasteboard()
+    types = pb.types()
+    # 检查是否有图片类型
+    image_types = ["Apple TIFF pasteboard type", "Apple PNG pasteboard type",
+                   "com.apple.cocoa TIFF", "com.apple.cocoa PNG",
+                   "com.apple.Preview document", "public.png", "public.tiff"]
+    has_image = any(t in types for t in image_types)
+    if not has_image:
+        sys.exit(1)
+    # 尝试获取 PNG
+    png_data = pb.dataForType_("public.png")
+    tiff_data = pb.dataForType_("com.apple.cocoa TIFF") or pb.dataForType_("Apple TIFF pasteboard type")
+    data = png_data if png_data else tiff_data
+    if data is None:
+        sys.exit(1)
+    # 写入 PNG 文件
+    success = data.writeToFile_atomically_("{temp_png}", True)
+    if not success:
+        sys.exit(1)
+    print("ok")
+except:
+    sys.exit(1)
+'''
+        result = subprocess.run(
+            ['python3', '-c', python_clipboard_script],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and Path(temp_png).exists() and Path(temp_png).stat().st_size > 50:
+            link = copy_attachment(Path(temp_png))
+            Path(temp_png).unlink(missing_ok=True)
+            return link
+    except:
+        pass
+
+    # 方法2: 用 pngpaste (如果安装了: brew install pngpaste)
     try:
         result = subprocess.run(['which', 'pngpaste'], capture_output=True, text=True)
         if result.returncode == 0:
-            result = subprocess.run(['pngpaste', temp_png], capture_output=True, timeout=5)
-            if Path(temp_png).exists() and Path(temp_png).stat().st_size > 100:
-                link = copy_attachment(Path(temp_png))
-                Path(temp_png).unlink(missing_ok=True)
+            pngpaste_temp = f"/tmp/qn_clip_paste_{timestamp}.png"
+            result = subprocess.run(['pngpaste', pngpaste_temp], capture_output=True, timeout=5)
+            if result.returncode == 0 and Path(pngpaste_temp).exists() and Path(pngpaste_temp).stat().st_size > 50:
+                link = copy_attachment(Path(pngpaste_temp))
+                Path(pngpaste_temp).unlink(missing_ok=True)
                 return link
     except:
         pass
 
-    # 方法2: 用 screencapture 截图剪贴板内容
+    # 方法3: 用 sips + 临时文件方法 (osascript write 方式)
     try:
-        # 先检查剪贴板是否有图片数据
         check = subprocess.run(
             ['osascript', '-e', 'clipboard info'],
             capture_output=True, text=True, timeout=5
         )
-        if 'picture' in check.stdout or 'PNG' in check.stdout or 'TIFF' in check.stdout:
-            # 用 osascript 读取为 TIFF
-            read_script = f'''
-            try
-                set the clipboard to (read (the clipboard as TIFF picture))
-                do shell script "osascript -e 'set the clipboard to (read (the clipboard as TIFF picture))' > {temp_tiff} 2>/dev/null || echo ''"
-                return "ok"
-            on error
-                return "error"
-            end try
-            '''
-            subprocess.run(['osascript', '-e', read_script], capture_output=True, timeout=5)
-
-            if Path(temp_tiff).exists() and Path(temp_tiff).stat().st_size > 100:
-                subprocess.run(['sips', '-s', 'format', 'png', temp_tiff, '--out', temp_png],
-                             capture_output=True, timeout=5)
-                if Path(temp_png).exists():
-                    link = copy_attachment(Path(temp_png))
-                    Path(temp_tiff).unlink(missing_ok=True)
-                    Path(temp_png).unlink(missing_ok=True)
-                    return link
-            Path(temp_tiff).unlink(missing_ok=True)
+        info = check.stdout.lower()
+        has_image = any(kw in info for kw in ['tiff', 'png ', 'picture', 'image', '«class png'])
+        if has_image:
+            # 用 python3 AppKit 作为最后的 fallback (与方法1相同, 但确保执行)
+            save_script = f'''
+try:
+    from AppKit import NSPasteboard
+    pb = NSPasteboard.generalPasteboard()
+    data = pb.dataForType_("public.png")
+    if data is None:
+        data = pb.dataForType_("public.tiff")
+    if data is None:
+        from Foundation import NSData
+        tiff = pb.dataForType_("com.apple.cocoa TIFF")
+        if tiff:
+            import subprocess
+            # Convert TIFF to PNG via sips
+            tiff_path = "/tmp/qn_clip_fallback.tiff"
+            tiff.writeToFile_atomically_(tiff_path, True)
+            import os
+            os.system(f"sips -s format png {{tiff_path}} --out {temp_png}")
+            print("ok")
+        else:
+            print("no image")
+    else:
+        data.writeToFile_atomically_("{temp_png}", True)
+        print("ok")
+except Exception as e:
+    print(f"error: {{e}}")
+'''
+            result = subprocess.run(
+                ['python3', '-c', save_script],
+                capture_output=True, text=True, timeout=10
+            )
+            if Path(temp_png).exists() and Path(temp_png).stat().st_size > 50:
+                link = copy_attachment(Path(temp_png))
+                Path(temp_png).unlink(missing_ok=True)
+                return link
     except:
         pass
 
@@ -199,8 +260,12 @@ def show_input_dialog():
     today = datetime.now()
     date_full = today.strftime("%Y-%m-%d")
 
+    # 先检测剪贴板是否有图片
+    clipboard_link = save_clipboard_image()
+    has_image = "✅ 有" if clipboard_link else "❌ 无"
+
     script = f'''
-    set theResult to (display dialog "📝 快速笔记" & return & return & "日期: {date_full}" & return & "保存时自动检测剪贴板图片" default answer "" buttons {{"取消", "添加附件", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
+    set theResult to (display dialog "📝 快速笔记" & return & return & "📅 日期: {date_full}" & return & "剪贴板图片: {has_image}" & return & return & "💡 提示: 先点击「粘贴图片」按钮，再写文字" default answer "" buttons {{"取消", "粘贴图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
     return text returned of theResult & "|" & button returned of theResult
     '''
 
@@ -213,9 +278,63 @@ def show_input_dialog():
                 content = parts[0]
                 button = parts[1]
 
-                # 添加附件循环
                 attachments = []
-                while button == "添加附件":
+                image_markdown = ""
+
+                # 粘贴图片按钮
+                if button == "粘贴图片":
+                    # 重新检测剪贴板图片
+                    clip_link = save_clipboard_image()
+                    if clip_link:
+                        image_markdown = clip_link
+                        show_notification("QuickNote ✏️", "🖼️ 图片已粘贴到文本!")
+                    else:
+                        show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
+
+                    # 再次弹出输入框，让用户继续输入
+                    script2 = f'''
+                    set theResult to (display dialog "📝 快速笔记 - 图片已插入" & return & return & "📅 日期: {date_full}" & return & "图片已添加: {image_markdown if image_markdown else "(无)"}" default answer "{image_markdown}" buttons {{"取消", "继续添加图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
+                    return text returned of theResult & "|" & button returned of theResult
+                    '''
+                    try:
+                        result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
+                        if result2.returncode == 0 and result2.stdout.strip():
+                            parts2 = result2.stdout.strip().split('|')
+                            if len(parts2) >= 2:
+                                content = parts2[0]
+                                button2 = parts2[1]
+
+                                # 继续添加图片循环
+                                while button2 == "继续添加图片":
+                                    clip_link2 = save_clipboard_image()
+                                    if clip_link2:
+                                        content = content + "\n" + clip_link2
+                                        show_notification("QuickNote ✏️", "🖼️ 图片已追加!")
+                                    else:
+                                        show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
+
+                                    script3 = '''
+                                    set theResult to (display dialog "📝 快速笔记" & return & return & "输入内容，或继续添加图片" default answer "" buttons {"取消", "继续添加图片", "保存"} default button 3 giving up after 300 with title "QuickNote ✏️")
+                                    return text returned of theResult & "|" & button returned of theResult
+                                    '''
+                                    try:
+                                        result3 = subprocess.run(['osascript', '-e', script3], capture_output=True, text=True, timeout=300)
+                                        if result3.returncode == 0 and result3.stdout.strip():
+                                            parts3 = result3.stdout.strip().split('|')
+                                            if len(parts3) >= 2:
+                                                content = parts3[0]
+                                                button2 = parts3[1]
+                                                if button2 != "继续添加图片":
+                                                    break
+                                        else:
+                                            break
+                                    except:
+                                        break
+                    except:
+                        pass
+
+                # 添加附件循环
+                while button == "添加附件" or button == "继续添加图片":
                     file_script = '''
                     set theFiles to choose file with prompt "选择图片或附件" with multiple selections allowed
                     set filePaths to ""
