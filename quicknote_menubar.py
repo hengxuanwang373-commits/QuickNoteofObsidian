@@ -4,6 +4,7 @@ QuickNote Menu Bar - 菜单栏版本
 - 每天一个文件
 - 支持粘贴图片 (通过 osascript 读取剪贴板)
 - 可配置设置
+- 支持全局快捷键
 """
 
 import rumps
@@ -13,8 +14,17 @@ import shutil
 import hashlib
 import json
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
+from collections import defaultdict
+
+try:
+    import AppKit
+    from PyObjCTools import AppHelper
+    HAS_PYOBJC = True
+except ImportError:
+    HAS_PYOBJC = False
 
 # ==================== 配置 ====================
 # 使用本地 Documents 目录,避免 iCloud Drive 沙盒权限问题
@@ -23,7 +33,8 @@ CONFIG_PATH = Path.home() / "Library/Preferences/com.quicknote.menubar.json"
 
 DEFAULT_CONFIG = {
     "save_path": str(LOCAL_QUICKNOTES),
-    "show_notifications": True
+    "show_notifications": True,
+    "global_shortcut": ""
 }
 
 # ==================== 配置管理 ====================
@@ -48,6 +59,156 @@ def get_save_path():
 
 def get_attachments_dir():
     return get_save_path() / "attachments"
+
+# ==================== 全局快捷键管理器 ====================
+class GlobalHotkeyManager:
+    """使用 Carbon API 管理全局快捷键"""
+
+    def __init__(self):
+        self.hotkey_ref = None
+        self.event_hot_key_ref = None
+        self.shortcut_keycode = None
+        self.shortcut_modifiers = None
+        self.callback = None
+        self.running = False
+
+    def _carbonModifiers(self, modifiers: dict) -> int:
+        """将修饰键字典转换为 Carbon 修饰键标志"""
+        from Carbon.Event import (cmdKey, ctrlKey, optionKey, shiftKey)
+        flags = 0
+        if modifiers.get('cmd', False):
+            flags |= cmdKey
+        if modifiers.get('ctrl', False):
+            flags |= ctrlKey
+        if modifiers.get('alt', False):
+            flags |= optionKey
+        if modifiers.get('shift', False):
+            flags |= shiftKey
+        return flags
+
+    def _parseShortcut(self, shortcut_str: str):
+        """解析快捷键字符串，如 '⌘⇧N' -> (keycode, carbon_modifiers)"""
+        from Carbon.Event import (cmdKey, ctrlKey, optionKey, shiftKey, kVK_ANSI_N)
+        # 快捷键映射
+        key_map = {
+            'A': 0x00, 'S': 0x01, 'D': 0x02, 'F': 0x03, 'H': 0x04,
+            'G': 0x05, 'Z': 0x06, 'X': 0x07, 'C': 0x08, 'V': 0x09,
+            'B': 0x0B, 'Q': 0x0C, 'W': 0x0D, 'E': 0x0E, 'R': 0x0F,
+            'Y': 0x10, 'T': 0x11, '1': 0x12, '2': 0x13, '3': 0x14,
+            '4': 0x15, '6': 0x16, '5': 0x17, '9': 0x19, '7': 0x1A,
+            '8': 0x1C, '0': 0x1D, 'O': 0x1F, 'U': 0x20, 'I': 0x22,
+            'P': 0x23, 'L': 0x25, 'J': 0x26, 'K': 0x28, 'N': 0x2D,
+            'M': 0x2E, 'SPACE': 0x31,
+        }
+        modifiers = {'cmd': False, 'ctrl': False, 'alt': False, 'shift': False}
+        key_char = None
+
+        # 解析修饰键符号
+        for part in shortcut_str.split():
+            part = part.strip()
+            if '⌘' in part or 'Cmd' in part or 'Command' in part:
+                modifiers['cmd'] = True
+            if '⇧' in part or 'Shift' in part:
+                modifiers['shift'] = True
+            if '⌥' in part or 'Opt' in part or 'Alt' in part:
+                modifiers['alt'] = True
+            if '⌃' in part or 'Ctrl' in part:
+                modifiers['ctrl'] = True
+            # 提取字母/数字
+            for k in key_map:
+                if k in part.upper():
+                    key_char = k.upper()
+                    break
+
+        if key_char and key_char in key_map:
+            keycode = key_map[key_char]
+            carbon_mods = self._carbonModifiers(modifiers)
+            return keycode, carbon_mods
+        return None, 0
+
+    def register(self, shortcut_str: str, callback):
+        """注册全局快捷键"""
+        if not shortcut_str:
+            self.unregister()
+            return True
+
+        if not HAS_PYOBJC:
+            return False
+
+        try:
+            from Carbon.Event import RegisterEventHotKey, kEventClassKeyboard, kEventHotKeyPressed
+            from Carbon.Events import GetEventParameter, typeEventHotKeyID
+            import Carbon
+
+            keycode, modifiers = self._parseShortcut(shortcut_str)
+            if keycode is None:
+                return False
+
+            self.unregister()
+            self.callback = callback
+
+            # 注册快捷键
+            hot_key_id = Carbon.EventHotKeyID(id=1, signature=0x514E4F54)  # 'QNOT'
+            err, self.hotkey_ref = RegisterEventHotKey(
+                keycode, modifiers, hot_key_id,
+                Carbon.kEventMainWindow, 0, self.hotkey_ref
+            )
+
+            if err == 0:
+                # 安装事件处理
+                err = Carbon.InstallEventHandler(
+                    Carbon.GetApplicationEventTarget(),
+                    self._hotkey_handler,
+                    1,
+                    (Carbon.kEventClassKeyboard, kEventHotKeyPressed),
+                    0
+                )
+                self.running = True
+                return True
+        except Exception as e:
+            print(f"注册快捷键失败: {e}")
+        return False
+
+    def _hotkey_handler(self, next_handler, event, user_data):
+        """快捷键事件处理"""
+        if self.callback:
+            # 在主线程中调用回调
+            AppKit.NSApplication.sharedApplication().invokeOnMainThread_(self.callback)
+        return 0
+
+    def unregister(self):
+        """注销快捷键"""
+        self.running = False
+        if self.hotkey_ref:
+            try:
+                from Carbon.Event import UnregisterEventHotKey
+                UnregisterEventHotKey(self.hotkey_ref)
+            except:
+                pass
+            self.hotkey_ref = None
+        self.callback = None
+
+
+# 全局快捷键管理器实例
+hotkey_manager = GlobalHotkeyManager()
+hotkey_callback_ref = None
+
+
+def setup_global_hotkey():
+    """设置全局快捷键（由应用启动时调用）"""
+    global hotkey_callback_ref
+    config = load_config()
+    shortcut = config.get("global_shortcut", "")
+
+    def trigger_note():
+        show_input_dialog()
+
+    hotkey_callback_ref = trigger_note
+    if shortcut:
+        success = hotkey_manager.register(shortcut, trigger_note)
+        if success and config.get("show_notifications", True):
+            show_notification("QuickNote ✏️", f"全局快捷键 ⌘⇧N 已启用 ✓")
+
 
 # ==================== 工具函数 ====================
 def get_chinese_weekday():
@@ -406,23 +567,90 @@ def show_settings_dialog():
     """显示设置对话框"""
     config = load_config()
     save_path = config.get("save_path", str(LOCAL_QUICKNOTES))
-    show_notify = config.get("show_notifications", True)
 
     script = f'''
-    set theDialog to display dialog "⚙️ QuickNote 设置" & return & return & "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
-    return text returned of theDialog
+    display dialog "⚙️ QuickNote 设置" & return & return & "保存路径:" default answer "{save_path}" buttons {{"取消", "设置快捷键", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
+    return button returned of result
     '''
 
     try:
         result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=300)
         if result.returncode == 0 and result.stdout.strip():
-            new_path = result.stdout.strip()
-            if new_path:
-                config["save_path"] = new_path
-                save_config(config)
-                show_notification("QuickNote ✏️", "设置已保存 ✓")
+            button = result.stdout.strip()
+
+            if button == "设置快捷键":
+                show_shortcut_dialog()
+                # 设置完快捷键后，继续修改保存路径
+                script2 = f'''
+                display dialog "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
+                return text returned of result
+                '''
+                result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
+                if result2.returncode == 0 and result2.stdout.strip():
+                    new_path = result2.stdout.strip()
+                    if new_path:
+                        config["save_path"] = new_path
+                        save_config(config)
+                        show_notification("QuickNote ✏️", "设置已保存 ✓")
+                return
+
+            if button == "保存":
+                script2 = f'''
+                display dialog "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
+                return text returned of result
+                '''
+                result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
+                if result2.returncode == 0 and result2.stdout.strip():
+                    new_path = result2.stdout.strip()
+                    if new_path:
+                        config["save_path"] = new_path
+                        save_config(config)
+                        show_notification("QuickNote ✏️", "设置已保存 ✓")
     except:
         pass
+
+
+def show_shortcut_dialog():
+    """显示快捷键设置对话框"""
+    config = load_config()
+    current_shortcut = config.get("global_shortcut", "")
+    display_shortcut = current_shortcut if current_shortcut else "未设置"
+
+    script = f'''
+    display dialog "⚙️ 全局快捷键设置" & return & return & "当前快捷键: {display_shortcut}" & return & return & "输入新的快捷键(如 ⌘⇧N):" buttons {{"取消", "禁用快捷键", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
+    return text returned of result & "|" & button returned of result
+    '''
+
+    try:
+        result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split('|')
+            if len(parts) >= 2:
+                new_shortcut = parts[0].strip()
+                button = parts[1].strip()
+
+                if button == "禁用快捷键":
+                    config["global_shortcut"] = ""
+                    hotkey_manager.unregister()
+                    save_config(config)
+                    show_notification("QuickNote ✏️", "全局快捷键已禁用")
+                    return
+
+                if new_shortcut and button == "保存":
+                    # 验证快捷键格式
+                    test_key, test_mods = hotkey_manager._parseShortcut(new_shortcut)
+                    if test_key is not None:
+                        config["global_shortcut"] = new_shortcut
+                        save_config(config)
+                        success = hotkey_manager.register(new_shortcut, hotkey_callback_ref)
+                        if success:
+                            show_notification("QuickNote ✏️", f"快捷键已设置为 {new_shortcut} ✓")
+                        else:
+                            show_notification("QuickNote ✏️", "快捷键设置失败，请检查系统设置")
+                    else:
+                        show_notification("QuickNote ✏️", "无效的快捷键格式")
+    except Exception as e:
+        show_notification("QuickNote ✏️", f"设置失败: {e}")
 
 # ==================== 菜单栏应用 ====================
 class QuickNoteApp(rumps.App):
@@ -430,16 +658,23 @@ class QuickNoteApp(rumps.App):
         super().__init__("📝")
         self.menu = [
             rumps.MenuItem("快速记录 ✏️", callback=self.on_quick_note),
+            rumps.MenuItem("🌐 全局快捷键", callback=self.on_global_shortcut),
             None,
             rumps.MenuItem("设置 ⚙️", callback=self.on_settings),
             rumps.MenuItem("打开 QuickNotes", callback=self.open_folder),
             None,
             rumps.MenuItem("退出", callback=self.on_quit)
         ]
+        # 启动时注册全局快捷键
+        setup_global_hotkey()
 
     @rumps.clicked("快速记录 ✏️")
     def on_quick_note(self, sender):
         show_input_dialog()
+
+    @rumps.clicked("🌐 全局快捷键")
+    def on_global_shortcut(self, sender):
+        show_shortcut_dialog()
 
     @rumps.clicked("设置 ⚙️")
     def on_settings(self, sender):
