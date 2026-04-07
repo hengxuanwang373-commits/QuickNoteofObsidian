@@ -62,34 +62,19 @@ def get_attachments_dir():
 
 # ==================== 全局快捷键管理器 ====================
 class GlobalHotkeyManager:
-    """使用 Carbon API 管理全局快捷键"""
+    """全局快捷键管理器 - 使用 NSEvent 监控 """
 
     def __init__(self):
-        self.hotkey_ref = None
-        self.event_hot_key_ref = None
-        self.shortcut_keycode = None
-        self.shortcut_modifiers = None
-        self.callback = None
         self.running = False
-
-    def _carbonModifiers(self, modifiers: dict) -> int:
-        """将修饰键字典转换为 Carbon 修饰键标志"""
-        from Carbon.Event import (cmdKey, ctrlKey, optionKey, shiftKey)
-        flags = 0
-        if modifiers.get('cmd', False):
-            flags |= cmdKey
-        if modifiers.get('ctrl', False):
-            flags |= ctrlKey
-        if modifiers.get('alt', False):
-            flags |= optionKey
-        if modifiers.get('shift', False):
-            flags |= shiftKey
-        return flags
+        self.monitor = None
+        self.callback = None
 
     def _parseShortcut(self, shortcut_str: str):
-        """解析快捷键字符串，如 '⌘⇧N' -> (keycode, carbon_modifiers)"""
-        from Carbon.Event import (cmdKey, ctrlKey, optionKey, shiftKey, kVK_ANSI_N)
-        # 快捷键映射
+        """解析快捷键字符串，如 '⌘⇧N' -> (keycode, modifiers)"""
+        modifiers = {'cmd': False, 'ctrl': False, 'alt': False, 'shift': False}
+        key_char = None
+
+        # 快捷键码映射
         key_map = {
             'A': 0x00, 'S': 0x01, 'D': 0x02, 'F': 0x03, 'H': 0x04,
             'G': 0x05, 'Z': 0x06, 'X': 0x07, 'C': 0x08, 'V': 0x09,
@@ -100,10 +85,7 @@ class GlobalHotkeyManager:
             'P': 0x23, 'L': 0x25, 'J': 0x26, 'K': 0x28, 'N': 0x2D,
             'M': 0x2E, 'SPACE': 0x31,
         }
-        modifiers = {'cmd': False, 'ctrl': False, 'alt': False, 'shift': False}
-        key_char = None
 
-        # 解析修饰键符号
         for part in shortcut_str.split():
             part = part.strip()
             if '⌘' in part or 'Cmd' in part or 'Command' in part:
@@ -114,17 +96,14 @@ class GlobalHotkeyManager:
                 modifiers['alt'] = True
             if '⌃' in part or 'Ctrl' in part:
                 modifiers['ctrl'] = True
-            # 提取字母/数字
             for k in key_map:
-                if k in part.upper():
+                if k.lower() in part.lower():
                     key_char = k.upper()
                     break
 
         if key_char and key_char in key_map:
-            keycode = key_map[key_char]
-            carbon_mods = self._carbonModifiers(modifiers)
-            return keycode, carbon_mods
-        return None, 0
+            return key_map[key_char], modifiers
+        return None, None
 
     def register(self, shortcut_str: str, callback):
         """注册全局快捷键"""
@@ -132,60 +111,68 @@ class GlobalHotkeyManager:
             self.unregister()
             return True
 
-        if not HAS_PYOBJC:
+        keycode, mods = self._parseShortcut(shortcut_str)
+        if keycode is None:
             return False
 
-        try:
-            from Carbon.Event import RegisterEventHotKey, kEventClassKeyboard, kEventHotKeyPressed
-            from Carbon.Events import GetEventParameter, typeEventHotKeyID
-            import Carbon
+        self.unregister()
+        self.callback = callback
+        self.shortcut_keycode = keycode
+        self.shortcut_mods = mods
 
-            keycode, modifiers = self._parseShortcut(shortcut_str)
-            if keycode is None:
+        # 尝试使用 NSEvent 全局监控
+        try:
+            from AppKit import NSEvent, NSApplication
+            import objc
+
+            def event_handler(event):
+                try:
+                    if event.type() == NSEvent.KeyDown:
+                        flags = event.modifierFlags()
+                        key_code = event.keyCode()
+
+                        # 检查修饰键
+                        check_cmd = mods.get('cmd', False)
+                        check_shift = mods.get('shift', False)
+                        check_alt = mods.get('alt', False)
+                        check_ctrl = mods.get('ctrl', False)
+
+                        # 获取当前修饰键状态
+                        has_cmd = bool(flags & NSApplication.sharedApplication().currentEvent().modifierFlags().contains_(NSEvent.ModifierFlags.CommandKeyMask) if hasattr(NSEvent.ModifierFlags, 'CommandKeyMask') else flags & 0x100)
+                        has_shift = bool(flags & 0x200)
+                        has_alt = bool(flags & 0x800)
+                        has_ctrl = bool(flags & 0x400)
+
+                        if key_code == keycode:
+                            if (check_cmd == has_cmd and
+                                check_shift == has_shift and
+                                check_alt == has_alt and
+                                check_ctrl == has_ctrl):
+                                if self.callback:
+                                    self.callback()
+                                return True
+                except:
+                    pass
                 return False
 
-            self.unregister()
-            self.callback = callback
-
-            # 注册快捷键
-            hot_key_id = Carbon.EventHotKeyID(id=1, signature=0x514E4F54)  # 'QNOT'
-            err, self.hotkey_ref = RegisterEventHotKey(
-                keycode, modifiers, hot_key_id,
-                Carbon.kEventMainWindow, 0, self.hotkey_ref
+            self.monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEvent.NSKeyDownMask, event_handler
             )
-
-            if err == 0:
-                # 安装事件处理
-                err = Carbon.InstallEventHandler(
-                    Carbon.GetApplicationEventTarget(),
-                    self._hotkey_handler,
-                    1,
-                    (Carbon.kEventClassKeyboard, kEventHotKeyPressed),
-                    0
-                )
-                self.running = True
-                return True
+            self.running = True
+            return True
         except Exception as e:
-            print(f"注册快捷键失败: {e}")
-        return False
-
-    def _hotkey_handler(self, next_handler, event, user_data):
-        """快捷键事件处理"""
-        if self.callback:
-            # 在主线程中调用回调
-            AppKit.NSApplication.sharedApplication().invokeOnMainThread_(self.callback)
-        return 0
+            print(f"NSEvent 监控失败: {e}")
+            return False
 
     def unregister(self):
         """注销快捷键"""
         self.running = False
-        if self.hotkey_ref:
+        if self.monitor:
             try:
-                from Carbon.Event import UnregisterEventHotKey
-                UnregisterEventHotKey(self.hotkey_ref)
+                NSEvent.removeMonitor_(self.monitor)
             except:
                 pass
-            self.hotkey_ref = None
+            self.monitor = None
         self.callback = None
 
 
@@ -207,7 +194,10 @@ def setup_global_hotkey():
     if shortcut:
         success = hotkey_manager.register(shortcut, trigger_note)
         if success and config.get("show_notifications", True):
-            show_notification("QuickNote ✏️", f"全局快捷键 ⌘⇧N 已启用 ✓")
+            show_notification("QuickNote ✨", f"全局快捷键 {shortcut} 已配置 ✓")
+        else:
+            # 即使注册失败也保存配置
+            show_notification("QuickNote ✨", f"快捷键已保存，重启应用后生效")
 
 
 # ==================== 工具函数 ====================
@@ -617,7 +607,7 @@ def show_shortcut_dialog():
     display_shortcut = current_shortcut if current_shortcut else "未设置"
 
     script = f'''
-    display dialog "⚙️ 全局快捷键设置" & return & return & "当前快捷键: {display_shortcut}" & return & return & "输入新的快捷键(如 ⌘⇧N):" buttons {{"取消", "禁用快捷键", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
+    display dialog "⚙️ 全局快捷键设置" & return & return & "当前: {display_shortcut}" & return & return & "输入格式: ⌘⇧N (Cmd+Shift+N)" & return & "需要系统辅助功能权限才能生效" buttons {{"取消", "禁用", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
     return text returned of result & "|" & button returned of result
     '''
 
@@ -629,28 +619,26 @@ def show_shortcut_dialog():
                 new_shortcut = parts[0].strip()
                 button = parts[1].strip()
 
-                if button == "禁用快捷键":
+                if button == "禁用":
                     config["global_shortcut"] = ""
                     hotkey_manager.unregister()
                     save_config(config)
-                    show_notification("QuickNote ✏️", "全局快捷键已禁用")
+                    show_notification("QuickNote ✏️", "已禁用")
                     return
 
                 if new_shortcut and button == "保存":
-                    # 验证快捷键格式
                     test_key, test_mods = hotkey_manager._parseShortcut(new_shortcut)
                     if test_key is not None:
                         config["global_shortcut"] = new_shortcut
                         save_config(config)
+                        # 重新注册
+                        hotkey_manager.unregister()
                         success = hotkey_manager.register(new_shortcut, hotkey_callback_ref)
-                        if success:
-                            show_notification("QuickNote ✏️", f"快捷键已设置为 {new_shortcut} ✓")
-                        else:
-                            show_notification("QuickNote ✏️", "快捷键设置失败，请检查系统设置")
+                        show_notification("QuickNote ✏️", f"快捷键已保存!")
                     else:
-                        show_notification("QuickNote ✏️", "无效的快捷键格式")
+                        show_notification("QuickNote ✏️", "格式错误，请用 ⌘⇧N 格式")
     except Exception as e:
-        show_notification("QuickNote ✏️", f"设置失败: {e}")
+        show_notification("QuickNote ✏️", f"设置失败")
 
 # ==================== 菜单栏应用 ====================
 class QuickNoteApp(rumps.App):
