@@ -54,6 +54,39 @@ dist/QuickNoteMenuBar.app/
 4. `save_to_daily()` appends entry to daily file: `26_{MM}/{yy}{mm}{dd}.md`
 5. `copy_attachment()` saves images to `{save_path}/attachments/`
 
+## Development Workflow
+
+### Module Isolation
+**每次只修改一个模块**。每个功能应该是独立模块，修改时不会影响其他模块。
+
+当前模块划分：
+- `save_clipboard_image()` - 剪贴板读取（独立函数）
+- `copy_attachment()` - 附件复制到 attachments 目录
+- `save_to_daily()` - 日记文件读写
+- `show_input_dialog()` - 输入对话框逻辑
+- `show_settings_dialog()` - 设置对话框
+- `GlobalHotkeyManager` - 全局快捷键管理（独立类）
+
+### 测试流程（修改后必做）
+**每次修改功能后，必须编写测试脚本验证修改正确性，才能构建。**
+
+测试脚本命名规范：`test_{功能模块}.py`
+
+测试流程：
+1. 编写测试脚本，模拟输入
+2. 运行测试脚本验证输出
+3. 确认功能正确后，再执行构建
+
+示例测试流程：
+```bash
+# 1. 编写测试脚本 test_clipboard.py
+# 2. 运行测试
+python3 test_clipboard.py
+
+# 3. 测试通过后构建
+python3 -m PyInstaller --windowed --onedir --name QuickNoteMenuBar quicknote_menubar.py
+```
+
 ## Important Implementation Notes
 
 ### Clipboard Access
