@@ -39,6 +39,19 @@ class InputResult:
     attachments: tuple[str, ...]
 
 
+class PanelDelegate:
+    """面板委托，处理窗口事件"""
+    def __init__(self, panel_ref):
+        self._panel_ref = panel_ref
+
+    def windowDidResize_(self, notification):
+        """窗口大小改变时调用"""
+        panel = self._panel_ref()
+        if not panel:
+            return
+        panel._handle_resize()
+
+
 class ResizableInputPanel:
     """
     可调整大小的文本输入面板
@@ -84,6 +97,8 @@ class ResizableInputPanel:
         self._panel: NSPanel | None = None
         self._text_view: NSTextView | None = None
         self._button_map: dict[str, NSButton] = {}
+        self._scroll_view: NSScrollView | None = None
+        self._delegate: PanelDelegate | None = None
 
     def run(self) -> InputResult | None:
         """
@@ -116,6 +131,10 @@ class ResizableInputPanel:
         self._panel.setIsMovableByWindowBackground_(True)
         self._panel.setHidesOnDeactivate_(False)
 
+        # 设置 resize 委托
+        self._delegate = PanelDelegate(lambda: self._panel)
+        self._panel.setDelegate_(self._delegate)
+
     def _setup_content(self):
         """设置面板内容区域"""
         content_view = self._panel.contentView()
@@ -145,16 +164,20 @@ class ResizableInputPanel:
         self._text_view.setMinSize_(NSSize(100, 80))
         self._text_view.setMaxSize_(NSSize(float('inf'), float('inf')))
         self._text_view.setVerticallyResizable_(True)
-        self._text_view.setHorizontallyResizable_(False)
+        self._text_view.setHorizontallyResizable_(True)
         self._text_view.setRichText_(False)
         self._text_view.setFont_(NSFont.systemFontOfSize_(14))
         self._text_view.setTextColor_(NSColor.textColor())
         self._text_view.setBackgroundColor_(NSColor.textBackgroundColor())
         self._text_view.setString_(self._default_text)
         self._text_view.setAllowsUndo_(True)
+        # 使文本容器跟踪文本视图宽度变化
+        self._text_view.textContainer().setWidthTracksTextView_(True)
+        self._text_view.textContainer().setContainerSize_(NSSize(self._width - 60, float('inf')))
 
         scroll_view.setDocumentView_(self._text_view)
         content_view.addSubview_(scroll_view)
+        self._scroll_view = scroll_view
 
     def _setup_buttons(self):
         """设置按钮区域"""
@@ -213,6 +236,32 @@ class ResizableInputPanel:
             x = (screen_frame.size.width - panel_frame.size.width) / 2
             y = (screen_frame.size.height - panel_frame.size.height) / 2
             self._panel.setFrameOrigin_(NSPoint(x, y))
+
+    def _handle_resize(self):
+        """处理窗口大小改变"""
+        if not self._panel or not self._scroll_view or not self._text_view:
+            return
+
+        panel_frame = self._panel.frame()
+        new_width = panel_frame.size.width
+        new_height = panel_frame.size.height
+
+        # 更新标题标签位置
+        content_view = self._panel.contentView()
+        for subview in content_view.subviews():
+            if isinstance(subview, NSTextField) and not subview.isEditable():
+                # 找到标题标签
+                subview.setFrame_(NSRect(15, new_height - 50, new_width - 30, 30))
+                break
+
+        # 更新滚动视图大小
+        text_view_height = max(100, new_height - 150)
+        scroll_frame = NSRect(15, 60, new_width - 30, text_view_height)
+        self._scroll_view.setFrame_(scroll_frame)
+
+        # 更新文本视图大小
+        text_frame = NSRect(0, 0, new_width - 60, text_view_height)
+        self._text_view.setFrame_(text_frame)
 
     def _close(self):
         """关闭面板"""
