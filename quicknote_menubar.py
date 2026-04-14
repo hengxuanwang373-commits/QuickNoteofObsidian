@@ -34,7 +34,9 @@ CONFIG_PATH = Path.home() / "Library/Preferences/com.quicknote.menubar.json"
 DEFAULT_CONFIG = {
     "save_path": str(LOCAL_QUICKNOTES),
     "show_notifications": True,
-    "global_shortcut": ""
+    "global_shortcut": "",
+    "dialog_width": 500,
+    "dialog_height": 300
 }
 
 # ==================== 配置管理 ====================
@@ -350,22 +352,111 @@ def save_clipboard_image() -> str:
 
     return None
 
-def show_notification(title: str, message: str):
-    config = load_config()
-    if config.get("show_notifications", True):
-        subprocess.run(['osascript', '-e', f'display notification "{message}" with title "{title}"'])
-
 def show_input_dialog():
-    """显示输入对话框"""
+    """显示输入对话框（使用可调整大小的文本框）"""
+    config = load_config()
     today = datetime.now()
     date_full = today.strftime("%Y-%m-%d")
 
+    # 获取配置的对话框尺寸
+    dialog_width = config.get("dialog_width", 500)
+    dialog_height = config.get("dialog_height", 300)
+
     # 先检测剪贴板是否有图片
     clipboard_link = save_clipboard_image()
-    has_image = "✅ 有" if clipboard_link else "❌ 无"
+    has_image = clipboard_link is not None
+
+    # 提示信息
+    prompt = f"📅 日期: {date_full}\n剪贴板图片: {'✅ 有' if has_image else '❌ 无'}\n\n💡 提示: 点击「粘贴图片」按钮添加截图"
+
+    try:
+        # 导入可调整大小的输入面板
+        from resizable_input_panel import show_resizable_input_dialog, Button, HAS_APPKIT
+
+        if not HAS_APPKIT:
+            # 如果没有 AppKit，使用原来的 osascript 方式
+            return _show_input_dialog_osascript(date_full, has_image)
+
+        # 使用原生 AppKit 面板
+        result = show_resizable_input_dialog(
+            title="📝 快速笔记",
+            prompt=prompt,
+            width=dialog_width,
+            height=dialog_height,
+            clipboard_image_available=has_image
+        )
+
+        if result is None:
+            show_notification("QuickNote ✏️", "⏰ 已取消")
+            return
+
+        content = result.content
+        button = result.button
+        attachments = []
+
+        # 处理粘贴图片按钮
+        if button == Button.PASTE_IMAGE.value:
+            clip_link = save_clipboard_image()
+            if clip_link:
+                attachments.append(clip_link)
+                show_notification("QuickNote ✏️", "🖼️ 图片已粘贴到附件!")
+            else:
+                show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
+
+            # 继续添加图片循环（使用 osascript 简单对话框）
+            while True:
+                script = f'''
+                display dialog "📝 快速笔记 - 图片已插入" & return & return & "📅 日期: {date_full}" & return & "已添加 {len(attachments)} 个图片" buttons {{"取消", "继续添加图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
+                return button returned of result
+                '''
+                result2 = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, timeout=300)
+                if result2.returncode != 0:
+                    break
+                btn2 = result2.stdout.strip()
+                if btn2 == "继续添加图片":
+                    clip_link2 = save_clipboard_image()
+                    if clip_link2:
+                        attachments.append(clip_link2)
+                        show_notification("QuickNote ✏️", "🖼️ 图片已追加!")
+                    else:
+                        show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
+                else:
+                    break
+
+        # 保存笔记
+        full_content = content
+        if attachments:
+            if full_content:
+                full_content += "\n\n" + "\n".join(attachments)
+            else:
+                full_content = "\n".join(attachments)
+
+        if full_content.strip():
+            success, msg = save_to_daily(full_content)
+            if success:
+                count = len(attachments)
+                if count > 0:
+                    show_notification("QuickNote ✏️", f"已保存! 含 {count} 个附件 ✓")
+                else:
+                    show_notification("QuickNote ✏️", "已保存到日记 ✓")
+            else:
+                show_notification("QuickNote ✏️", f"❌ {msg}")
+        else:
+            show_notification("QuickNote ✏️", "内容为空，已取消保存")
+
+    except ImportError:
+        # 导入失败时使用 osascript 回退
+        return _show_input_dialog_osascript(date_full, has_image)
+    except Exception as e:
+        show_notification("QuickNote ✏️", f"❌ 错误: {e}")
+
+
+def _show_input_dialog_osascript(date_full: str, has_image: bool):
+    """原始的 osascript 输入对话框（回退方案）"""
+    has_image_str = "✅ 有" if has_image else "❌ 无"
 
     script = f'''
-    set theResult to (display dialog "📝 快速笔记" & return & return & "📅 日期: {date_full}" & return & "剪贴板图片: {has_image}" & return & return & "💡 提示: 先点击「粘贴图片」按钮，再写文字" default answer "" buttons {{"取消", "粘贴图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
+    set theResult to (display dialog "📝 快速笔记" & return & return & "📅 日期: {date_full}" & return & "剪贴板图片: {has_image_str}" & return & return & "💡 提示: 先点击「粘贴图片」按钮，再写文字" default answer "" buttons {{"取消", "粘贴图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
     return text returned of theResult & "|" & button returned of theResult
     '''
 
@@ -379,7 +470,6 @@ def show_input_dialog():
                 button = parts[1]
 
                 attachments = []
-                image_markdown = ""
 
                 # 粘贴图片按钮
                 if button == "粘贴图片":
@@ -387,7 +477,6 @@ def show_input_dialog():
                     clip_link = save_clipboard_image()
                     if clip_link:
                         attachments.append(clip_link)
-                        image_markdown = clip_link
                         show_notification("QuickNote ✏️", "🖼️ 图片已粘贴到附件!")
                     else:
                         show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
@@ -507,9 +596,11 @@ def show_settings_dialog():
     """显示设置对话框"""
     config = load_config()
     save_path = config.get("save_path", str(LOCAL_QUICKNOTES))
+    dialog_width = config.get("dialog_width", 500)
+    dialog_height = config.get("dialog_height", 300)
 
     script = f'''
-    display dialog "⚙️ QuickNote 设置" & return & return & "保存路径:" default answer "{save_path}" buttons {{"取消", "设置快捷键", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️"
+    display dialog "⚙️ QuickNote 设置" & return & return & "保存路径:" default answer "{save_path}" buttons {{"取消", "设置快捷键", "对话框大小", "保存"}} default button 4 giving up after 300 with title "QuickNote ✏️"
     return button returned of result
     '''
 
@@ -535,6 +626,58 @@ def show_settings_dialog():
                         new_path = parts2[0].strip()
                         btn = parts2[1].strip()
                         if btn == "保存" and new_path:
+                            config["save_path"] = new_path
+                            save_config(config)
+                            show_notification("QuickNote ✨", "设置已保存 ✓")
+                return
+
+            if button == "对话框大小":
+                # 弹出对话框让用户输入宽高
+                script2 = f'''
+                display dialog "📐 对话框大小" & return & return & "宽度:" default answer "{dialog_width}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
+                return text returned of result & "|" & button returned of result
+                '''
+                result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
+                if result2.returncode == 0 and result2.stdout.strip():
+                    parts2 = result2.stdout.strip().split('|')
+                    if len(parts2) >= 2:
+                        new_width_str = parts2[0].strip()
+                        btn = parts2[1].strip()
+                        if btn == "保存" and new_width_str.isdigit():
+                            dialog_width = int(new_width_str)
+
+                            # 弹出对话框让用户输入高度
+                            script3 = f'''
+                            display dialog "📐 对话框高度" & return & return & "高度:" default answer "{dialog_height}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
+                            return text returned of result & "|" & button returned of result
+                            '''
+                            result3 = subprocess.run(['osascript', '-e', script3], capture_output=True, text=True, timeout=300)
+                            if result3.returncode == 0 and result3.stdout.strip():
+                                parts3 = result3.stdout.strip().split('|')
+                                if len(parts3) >= 2:
+                                    new_height_str = parts3[0].strip()
+                                    btn3 = parts3[1].strip()
+                                    if btn3 == "保存" and new_height_str.isdigit():
+                                        dialog_height = int(new_height_str)
+                                        config["dialog_width"] = dialog_width
+                                        config["dialog_height"] = dialog_height
+                                        save_config(config)
+                                        show_notification("QuickNote ✨", f"对话框大小已设为 {dialog_width}x{dialog_height}")
+
+                # 继续修改保存路径
+                config = load_config()
+                save_path = config.get("save_path", str(LOCAL_QUICKNOTES))
+                script4 = f'''
+                display dialog "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
+                return text returned of result & "|" & button returned of result
+                '''
+                result4 = subprocess.run(['osascript', '-e', script4], capture_output=True, text=True, timeout=300)
+                if result4.returncode == 0 and result4.stdout.strip():
+                    parts4 = result4.stdout.strip().split('|')
+                    if len(parts4) >= 2:
+                        new_path = parts4[0].strip()
+                        btn4 = parts4[1].strip()
+                        if btn4 == "保存" and new_path:
                             config["save_path"] = new_path
                             save_config(config)
                             show_notification("QuickNote ✨", "设置已保存 ✓")
