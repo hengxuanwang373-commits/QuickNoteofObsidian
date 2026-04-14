@@ -206,6 +206,14 @@ def setup_global_hotkey():
 
 
 # ==================== 工具函数 ====================
+def show_notification(title: str, message: str):
+    """显示 macOS 通知"""
+    try:
+        script = f'display notification "{message}" with title "{title}"'
+        subprocess.run(['osascript', '-e', script], capture_output=True, timeout=5)
+    except:
+        pass
+
 def get_chinese_weekday():
     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
     return weekdays[datetime.now().weekday()]
