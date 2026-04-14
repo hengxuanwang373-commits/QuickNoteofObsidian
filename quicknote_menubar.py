@@ -51,7 +51,8 @@ def save_config(config):
 
 def get_save_path():
     config = load_config()
-    save_path = Path(config.get("save_path", str(LOCAL_QUICKNOTES)))
+    save_path_str = os.path.expanduser(config.get("save_path", str(LOCAL_QUICKNOTES)))
+    save_path = Path(save_path_str)
     # 如果路径是 Obsidian vault 根目录，自动使用 QuickNotes 子文件夹
     if save_path.name == "Documents" and not str(save_path).endswith("QuickNotes"):
         save_path = save_path / "06📓QuickNotes"
@@ -122,12 +123,14 @@ class GlobalHotkeyManager:
 
         # 尝试使用 NSEvent 全局监控
         try:
-            from AppKit import NSEvent, NSApplication
-            import objc
+            from AppKit import NSEvent
+
+            # NSEvent event types: NSKeyDown = 10
+            NSKeyDownMask = 1 << 10  # 1024
 
             def event_handler(event):
                 try:
-                    if event.type() == NSEvent.KeyDown:
+                    if event.type() == 10:  # NSKeyDown
                         flags = event.modifierFlags()
                         key_code = event.keyCode()
 
@@ -137,11 +140,11 @@ class GlobalHotkeyManager:
                         check_alt = mods.get('alt', False)
                         check_ctrl = mods.get('ctrl', False)
 
-                        # 获取当前修饰键状态
-                        has_cmd = bool(flags & NSApplication.sharedApplication().currentEvent().modifierFlags().contains_(NSEvent.ModifierFlags.CommandKeyMask) if hasattr(NSEvent.ModifierFlags, 'CommandKeyMask') else flags & 0x100)
-                        has_shift = bool(flags & 0x200)
-                        has_alt = bool(flags & 0x800)
-                        has_ctrl = bool(flags & 0x400)
+                        # 获取当前修饰键状态 (NSEvent modifierFlags bitmasks)
+                        has_cmd = bool(flags & 0x100000)   # NSCommandKeyMask
+                        has_shift = bool(flags & 0x20000)  # NSShiftKeyMask
+                        has_alt = bool(flags & 0x80000)    # NSAlternateKeyMask
+                        has_ctrl = bool(flags & 0x40000)   # NSControlKeyMask
 
                         if key_code == keycode:
                             if (check_cmd == has_cmd and
@@ -156,7 +159,7 @@ class GlobalHotkeyManager:
                 return False
 
             self.monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-                NSEvent.NSKeyDownMask, event_handler
+                NSKeyDownMask, event_handler
             )
             self.running = True
             return True
@@ -295,109 +298,55 @@ def copy_attachment(file_path: Path) -> str:
 
 def save_clipboard_image() -> str:
     """保存剪贴板图片，返回 markdown 链接"""
+    if not HAS_PYOBJC:
+        return None
+
     timestamp = datetime.now().strftime("%H%M%S")
     temp_png = f"/tmp/qn_clip_{timestamp}.png"
 
-    # 方法1: 用 python3 + AppKit 读取剪贴板图片 (macOS 原生, 最可靠)
+    # 直接用 AppKit 读取剪贴板（在主进程中调用，不需要 subprocess）
     try:
-        python_clipboard_script = f'''
-import sys
-try:
-    from AppKit import NSPasteboard, NSBitmapImageRep
-    from Foundation import NSData
-    pb = NSPasteboard.generalPasteboard()
-    types = pb.types()
-    # 检查是否有图片类型
-    image_types = ["Apple TIFF pasteboard type", "Apple PNG pasteboard type",
-                   "com.apple.cocoa TIFF", "com.apple.cocoa PNG",
-                   "com.apple.Preview document", "public.png", "public.tiff"]
-    has_image = any(t in types for t in image_types)
-    if not has_image:
-        sys.exit(1)
-    # 尝试获取 PNG
-    png_data = pb.dataForType_("public.png")
-    tiff_data = pb.dataForType_("com.apple.cocoa TIFF") or pb.dataForType_("Apple TIFF pasteboard type")
-    data = png_data if png_data else tiff_data
-    if data is None:
-        sys.exit(1)
-    # 写入 PNG 文件
-    success = data.writeToFile_atomically_("{temp_png}", True)
-    if not success:
-        sys.exit(1)
-    print("ok")
-except:
-    sys.exit(1)
-'''
-        result = subprocess.run(
-            ['python3', '-c', python_clipboard_script],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0 and Path(temp_png).exists() and Path(temp_png).stat().st_size > 50:
-            link = copy_attachment(Path(temp_png))
-            Path(temp_png).unlink(missing_ok=True)
-            return link
-    except:
-        pass
-
-    # 方法2: 用 pngpaste (如果安装了: brew install pngpaste)
-    try:
-        result = subprocess.run(['which', 'pngpaste'], capture_output=True, text=True)
-        if result.returncode == 0:
-            pngpaste_temp = f"/tmp/qn_clip_paste_{timestamp}.png"
-            result = subprocess.run(['pngpaste', pngpaste_temp], capture_output=True, timeout=5)
-            if result.returncode == 0 and Path(pngpaste_temp).exists() and Path(pngpaste_temp).stat().st_size > 50:
-                link = copy_attachment(Path(pngpaste_temp))
-                Path(pngpaste_temp).unlink(missing_ok=True)
-                return link
-    except:
-        pass
-
-    # 方法3: 用 sips + 临时文件方法 (osascript write 方式)
-    try:
-        check = subprocess.run(
-            ['osascript', '-e', 'clipboard info'],
-            capture_output=True, text=True, timeout=5
-        )
-        info = check.stdout.lower()
-        has_image = any(kw in info for kw in ['tiff', 'png ', 'picture', 'image', '«class png'])
-        if has_image:
-            # 用 python3 AppKit 作为最后的 fallback (与方法1相同, 但确保执行)
-            save_script = f'''
-try:
-    from AppKit import NSPasteboard
-    pb = NSPasteboard.generalPasteboard()
-    data = pb.dataForType_("public.png")
-    if data is None:
-        data = pb.dataForType_("public.tiff")
-    if data is None:
+        from AppKit import NSPasteboard
         from Foundation import NSData
-        tiff = pb.dataForType_("com.apple.cocoa TIFF")
-        if tiff:
-            import subprocess
-            # Convert TIFF to PNG via sips
-            tiff_path = "/tmp/qn_clip_fallback.tiff"
-            tiff.writeToFile_atomically_(tiff_path, True)
-            import os
-            os.system(f"sips -s format png {{tiff_path}} --out {temp_png}")
-            print("ok")
-        else:
-            print("no image")
-    else:
-        data.writeToFile_atomically_("{temp_png}", True)
-        print("ok")
-except Exception as e:
-    print(f"error: {{e}}")
-'''
-            result = subprocess.run(
-                ['python3', '-c', save_script],
-                capture_output=True, text=True, timeout=10
-            )
-            if Path(temp_png).exists() and Path(temp_png).stat().st_size > 50:
-                link = copy_attachment(Path(temp_png))
-                Path(temp_png).unlink(missing_ok=True)
-                return link
-    except:
-        pass
+
+        pb = NSPasteboard.generalPasteboard()
+        types = pb.types()
+
+        # 检查是否有图片类型
+        image_types = {
+            "Apple TIFF pasteboard type", "Apple PNG pasteboard type",
+            "com.apple.cocoa TIFF", "com.apple.cocoa PNG",
+            "public.png", "public.tiff"
+        }
+        has_image = any(t in types for t in image_types)
+        if not has_image:
+            return None
+
+        # 尝试获取 PNG 数据
+        png_data = pb.dataForType_("public.png")
+        tiff_data = pb.dataForType_("public.tiff") or pb.dataForType_("com.apple.cocoa TIFF")
+        data = png_data if png_data else tiff_data
+
+        if data is None:
+            return None
+
+        # 写入 PNG 文件
+        success = data.writeToFile_atomically_(temp_png, True)
+        if not success or not Path(temp_png).exists():
+            return None
+
+        file_size = Path(temp_png).stat().st_size
+        if file_size < 50:
+            return None
+
+        # 复制到附件目录
+        link = copy_attachment(Path(temp_png))
+        Path(temp_png).unlink(missing_ok=True)
+        return link
+
+    except Exception as e:
+        print(f"剪贴板读取失败: {e}")
+        return None
 
     return None
 
@@ -437,16 +386,17 @@ def show_input_dialog():
                     # 重新检测剪贴板图片
                     clip_link = save_clipboard_image()
                     if clip_link:
+                        attachments.append(clip_link)
                         image_markdown = clip_link
-                        show_notification("QuickNote ✏️", "🖼️ 图片已粘贴到文本!")
+                        show_notification("QuickNote ✏️", "🖼️ 图片已粘贴到附件!")
                     else:
                         show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
 
                     # 再次弹出输入框，让用户继续输入
-                    script2 = f'''
-                    set theResult to (display dialog "📝 快速笔记 - 图片已插入" & return & return & "📅 日期: {date_full}" & return & "图片已添加: {image_markdown if image_markdown else "(无)"}" default answer "{image_markdown}" buttons {{"取消", "继续添加图片", "保存"}} default button 3 giving up after 300 with title "QuickNote ✏️")
+                    script2 = '''
+                    set theResult to (display dialog "📝 快速笔记 - 图片已插入" & return & return & "📅 日期: %s" & return & "图片已添加到附件" buttons {"取消", "继续添加图片", "保存"} default button 3 giving up after 300 with title "QuickNote ✏️")
                     return text returned of theResult & "|" & button returned of theResult
-                    '''
+                    ''' % date_full
                     try:
                         result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
                         if result2.returncode == 0 and result2.stdout.strip():
@@ -459,7 +409,7 @@ def show_input_dialog():
                                 while button2 == "继续添加图片":
                                     clip_link2 = save_clipboard_image()
                                     if clip_link2:
-                                        content = content + "\n" + clip_link2
+                                        attachments.append(clip_link2)
                                         show_notification("QuickNote ✏️", "🖼️ 图片已追加!")
                                     else:
                                         show_notification("QuickNote ✏️", "❌ 剪贴板中没有图片")
@@ -541,7 +491,7 @@ def show_input_dialog():
                 success, msg = save_to_daily(full_content)
 
                 if success:
-                    count = len(attachments) + (1 if clipboard_link else 0)
+                    count = len(attachments)
                     if count > 0:
                         show_notification("QuickNote ✏️", f"已保存! 含 {count} 个附件 ✓")
                     else:
@@ -570,32 +520,41 @@ def show_settings_dialog():
 
             if button == "设置快捷键":
                 show_shortcut_dialog()
+                # show_shortcut_dialog 保存后重新加载 config
+                config = load_config()
+                save_path = config.get("save_path", str(LOCAL_QUICKNOTES))
                 # 设置完快捷键后，继续修改保存路径
                 script2 = f'''
                 display dialog "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
-                return text returned of result
+                return text returned of result & "|" & button returned of result
                 '''
                 result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
                 if result2.returncode == 0 and result2.stdout.strip():
-                    new_path = result2.stdout.strip()
-                    if new_path:
-                        config["save_path"] = new_path
-                        save_config(config)
-                        show_notification("QuickNote ✏️", "设置已保存 ✓")
+                    parts2 = result2.stdout.strip().split('|')
+                    if len(parts2) >= 2:
+                        new_path = parts2[0].strip()
+                        btn = parts2[1].strip()
+                        if btn == "保存" and new_path:
+                            config["save_path"] = new_path
+                            save_config(config)
+                            show_notification("QuickNote ✨", "设置已保存 ✓")
                 return
 
             if button == "保存":
                 script2 = f'''
                 display dialog "保存路径:" default answer "{save_path}" buttons {{"取消", "保存"}} default button 2 giving up after 300 with title "QuickNote ✏️"
-                return text returned of result
+                return text returned of result & "|" & button returned of result
                 '''
                 result2 = subprocess.run(['osascript', '-e', script2], capture_output=True, text=True, timeout=300)
                 if result2.returncode == 0 and result2.stdout.strip():
-                    new_path = result2.stdout.strip()
-                    if new_path:
-                        config["save_path"] = new_path
-                        save_config(config)
-                        show_notification("QuickNote ✏️", "设置已保存 ✓")
+                    parts2 = result2.stdout.strip().split('|')
+                    if len(parts2) >= 2:
+                        new_path = parts2[0].strip()
+                        btn = parts2[1].strip()
+                        if btn == "保存" and new_path:
+                            config["save_path"] = new_path
+                            save_config(config)
+                            show_notification("QuickNote ✨", "设置已保存 ✓")
     except:
         pass
 

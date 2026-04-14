@@ -1,0 +1,2 @@
+#!/bin/bash
+/opt/homebrew/bin/python3 /Users/jiamingli_1/QuickNote/quicknote_menubar.py
